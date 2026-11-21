@@ -1,6 +1,0 @@
-interface:
-  display_name: "Golden Set B: Senior Quality Gate"
-  short_description: "시니어 개발자 관점 심각도 과락제(CRITICAL FAIL / MEDIUM·LOW Advice) 리뷰"
-  default_prompt: "Use $eval-senior-quality-gate as an independent senior reviewer to audit architecture, security, maintainability, skill compliance, and reward-hacking risks using severity tiers."
-policy:
-  allow_implicit_invocation: true

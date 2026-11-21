@@ -8,12 +8,10 @@
 
 ```text
 skills/<skill-name>/
-├── SKILL.md               # 필수: YAML frontmatter + 핵심 실행 지침
-├── agents/                # 권장: Codex/Grok 등 도구별 호출 메타데이터
-│   ├── openai.yaml
-│   └── grok.yaml
+├── SKILL.md               # 필수: YAML frontmatter + 핵심 실행 지침 (기본은 이 파일 1개만 유지)
 ├── references/            # 선택: 상세 사례, 체크리스트, 템플릿 (본문 비대화 방지)
-└── scripts/               # 선택: 결정론적 검증·보조 스크립트
+├── scripts/               # 선택: 결정론적 검증·보조 스크립트
+└── agents/                # 예외 선택: Codex UI 표시나 자동 호출 차단 등 특수 정책이 필요할 때만 openai.yaml 추가
 ```
 
 * `<skill-name>`은 소문자 kebab-case(`^[a-z0-9]+(-[a-z0-9]+)*$`)를 사용하며, 접두어로 역할을 바로 식별할 수 있게 명명하는 것을 권장합니다:
