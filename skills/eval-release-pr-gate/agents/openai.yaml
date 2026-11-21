@@ -1,0 +1,4 @@
+interface:
+  display_name: "Golden Set A: Release PR Gate"
+  short_description: "출시·통합 가능성 100% Hard Pass/Fail 검증 (골든셋 B와 병렬 실행)"
+  default_prompt: "Use $eval-release-pr-gate as an independent evaluator to verify build, TDD/TC, E2E/runtime, and security blockers with strict Pass/Fail evidence."

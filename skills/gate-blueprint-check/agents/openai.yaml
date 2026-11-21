@@ -1,0 +1,4 @@
+interface:
+  display_name: "Gate 0: Blueprint Check"
+  short_description: "개발 착수 전 청사진 충돌 점검 및 자율 구현 로드맵·TC 확정"
+  default_prompt: "Use $gate-blueprint-check to audit the blueprint for conflicts and open decisions, then finalize the autonomous implementation roadmap and Golden Set A TCs."
