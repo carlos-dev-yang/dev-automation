@@ -21,13 +21,16 @@ rd-skills/
 ├── AGENTS.md
 ├── ARCHITECTURE.md
 ├── SKILL_AUTHORING_GUIDE.md
+├── docs/
+│   ├── DECISION_HISTORY.md
+│   └── PROJECT_SETUP_GUIDE.md
 ├── templates/
 │   └── PROJECT_AGENTS_ROUTING.md
 ├── scripts/
 │   ├── validate-skills.mjs       # Frontmatter·메타데이터·링크 정합성 검증
 │   └── link-project.mjs          # 대상 프로젝트에 .agents/skills, .claude/skills 심볼릭 링크 연결
-└── skills/                       # 단일 플랫 구조 (별도 index 파일 및 drafts 폴더 없음)
-    ├── design-data-model/
+└── skills/                       # 단일 플랫 구조 — core, stack:*, general, project:* 전부 일원화
+    ├── design-data-model/        # (official 코어 10종 + status:draft 이관·실험 스킬)
     ├── design-feature-spec/
     ├── design-system-arch/
     ├── design-ui-ux/
@@ -36,7 +39,8 @@ rd-skills/
     ├── gate-blueprint-check/
     ├── impl-autonomous-slice/
     ├── ops-remediation-director/
-    └── ops-skill-evolution/
+    ├── ops-skill-evolution/
+    └── ...                       # 각 스킬 SKILL.md frontmatter가 유일한 인덱스(SSoT)
 ```
 
 ## 빠른 시작
@@ -49,16 +53,19 @@ node scripts/validate-skills.mjs
 
 ### 2. 개별 프로젝트에 심볼릭 링크 연결
 
-먼저 `--dry-run`으로 연결 대상과 기존 폴더 충돌 여부를 확인합니다.
+`dev-automation`은 항상 모든 대상 프로젝트와 **같은 부모 폴더 레벨(형제 디렉터리)**에 배치합니다.
+상세 이관·Git 등록 절차는 [docs/PROJECT_SETUP_GUIDE.md](./docs/PROJECT_SETUP_GUIDE.md)를 참고하세요.
+
+먼저 `--dry-run`으로 형제 디렉터리 배치와 기존 `.agents/skills`, `.claude/skills` 충돌 여부를 확인합니다.
 
 ```bash
-node scripts/link-project.mjs --project /Users/carlos-yang/dev/app-automation --dry-run
+node scripts/link-project.mjs --project ../<target-project> --dry-run
 ```
 
-기존 `.agents/skills`나 `.claude/skills`가 비어 있거나 이관을 마친 뒤 실제 링크를 생성합니다.
+기존 `.agents/skills`, `.claude/skills` 실폴더의 스킬을 별도로 이관하고 폴더를 비운 뒤 실제 심볼릭 링크(`../../dev-automation/skills`)를 생성합니다. 생성된 심볼릭 링크는 대상 프로젝트의 Git에 등록(커밋)해 둡니다.
 
 ```bash
-node scripts/link-project.mjs --project /Users/carlos-yang/dev/app-automation
+node scripts/link-project.mjs --project ../<target-project>
 ```
 
 > 개별 프로젝트는 루트 `AGENTS.md`(및 필요 시 `CLAUDE.md`)에 [templates/PROJECT_AGENTS_ROUTING.md](./templates/PROJECT_AGENTS_ROUTING.md)의 라우팅 표를 배치해 각 AI가 작업 단계별 주력 스킬을 자동으로 선택하게 합니다.

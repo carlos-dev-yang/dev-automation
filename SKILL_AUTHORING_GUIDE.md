@@ -36,11 +36,19 @@ description: >-
 metadata:
   status: official           # official | draft | deprecated
   version: "1.0"             # 개정 시 메이저/마이너 버전 갱신
-  stages: [stage-3-b]        # stage-1 | stage-2 | stage-3-a | stage-3-b | stage-4
-  scopes: [core]             # core | stack:rn | stack:web | stack:server | stack:db 등 다중 태그
-  roles: [reviewer-b]        # architect | implementer | reviewer-a | reviewer-b | director
+  stages: [stage-3-b]        # stage-1 | stage-2 | stage-3-a | stage-3-b | stage-4 (비개발 스킬은 생략 가능)
+  scopes: [core]             # core | stack:rn | stack:web | stack:server | stack:db | general | project:<repo>
+  roles: [reviewer-b]        # architect | implementer | reviewer-a | reviewer-b | director (비개발 스킬은 생략 가능)
 ---
 ```
+
+### 모든 스킬 일원화 및 스크립트 배치 원칙
+개별 프로젝트의 `.agents/skills`, `.claude/skills`는 모두 이 저장소의 `skills/`로 단일 심볼릭 링크되므로, **공용·스택·비개발(`general`)·특정 프로젝트 전용(`project:<repo>`) 스킬을 물리 폴더로 나누지 않고 모두 `skills/`에 일원화**합니다.
+* **오동작 차단**: 특정 프로젝트 전용이나 비개발 스킬은 `metadata.scopes`에 `project:<repo>` 또는 `general`을 명시하고, `description`에 활성화 조건(예: 특정 파일/스크립트 존재 여부, 코드 작업 비사용)을 분명히 적어 타 작업 간섭을 막습니다.
+* **스크립트 및 실행 요건 배치 구분**:
+  * **스킬 자체에 속한 범용/비개발 보조 스크립트**: `skills/<skill-name>/scripts/` 안에 함께 두어 어느 프로젝트에서나 심볼릭 링크로 바로 실행합니다.
+  * **특정 프로젝트의 코드·인프라에 묶인 스크립트**: 해당 프로젝트 레포에 그대로 두고, 중앙의 `SKILL.md`는 깨지는 `../../../` 상대 마크다운 링크 대신 **현재 작업 디렉터리(CWD) 기준 경로**(예: `` `scripts/beta-feedback/README.md` ``)로 참조합니다.
+  * **추가 개발 환경·런타임 요건**: 스킬 실행에 특정 CLI·런타임·패키지 설치가 필요하면 `SKILL.md`의 사전 요건(Prerequisites)에 명시하고, 레포 종속 조건은 `description`에 분명히 적습니다.
 
 ### 필수 작성 원칙
 1. **`name`**: 반드시 폴더명(`<skill-name>`)과 정확히 일치해야 합니다.

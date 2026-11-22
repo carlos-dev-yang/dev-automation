@@ -10,6 +10,7 @@ const centralSkillsDir = path.join(repoRoot, "skills")
 function parseArgs(argv) {
   let projectDir = null
   let dryRun = false
+  let allowNonSibling = false
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i]
     if (arg === "--project" && argv[i + 1]) {
@@ -17,17 +18,19 @@ function parseArgs(argv) {
       i += 1
     } else if (arg === "--dry-run") {
       dryRun = true
+    } else if (arg === "--allow-non-sibling") {
+      allowNonSibling = true
     } else if (arg === "--help" || arg === "-h") {
       console.log(
-        "Usage: node scripts/link-project.mjs --project <absolute-or-relative-path> [--dry-run]",
+        "Usage: node scripts/link-project.mjs --project <absolute-or-relative-path> [--dry-run] [--allow-non-sibling]",
       )
       process.exit(0)
     }
   }
-  return { projectDir, dryRun }
+  return { projectDir, dryRun, allowNonSibling }
 }
 
-const { projectDir, dryRun } = parseArgs(process.argv.slice(2))
+const { projectDir, dryRun, allowNonSibling } = parseArgs(process.argv.slice(2))
 
 if (!projectDir) {
   console.error("Missing required argument: --project <path>")
@@ -36,6 +39,18 @@ if (!projectDir) {
 
 if (!fs.existsSync(projectDir)) {
   console.error(`Project directory does not exist: ${projectDir}`)
+  process.exit(1)
+}
+
+const expectedRepoName = "dev-automation"
+const isSameParent = path.dirname(projectDir) === path.dirname(repoRoot)
+const isStandardRepoName = path.basename(repoRoot) === expectedRepoName
+
+if ((!isSameParent || !isStandardRepoName) && !allowNonSibling) {
+  console.error(
+    `[LAYOUT ERROR] Central repo (${repoRoot}) and target project (${projectDir}) must be sibling directories under the same parent folder with repo folder name '${expectedRepoName}' so Git-tracked symlinks always resolve to '../../${expectedRepoName}/skills'.`,
+  )
+  console.error("Move/clone them as sibling directories, or pass --allow-non-sibling to override.")
   process.exit(1)
 }
 
