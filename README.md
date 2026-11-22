@@ -6,7 +6,8 @@
 
 ## 핵심 문서
 
-- [ARCHITECTURE.md](./ARCHITECTURE.md) — Stage 1~4 파이프라인, 병렬 이중 골든셋, **스킬 선교정 → 작업 후교정** 피드백 루프, 디자인 시스템 지연 결정(Deferred ADR)
+- [ARCHITECTURE.md](./ARCHITECTURE.md) — Stage 1~4 파이프라인, 병렬 이중 골든셋, **스킬 선교정 → 작업 후교정** 피드백 루프, Go 하네스·CLI 계약, 디자인 시스템 지연 결정(Deferred ADR)
+- [docs/DECISION_HISTORY.md](./docs/DECISION_HISTORY.md) — 모든 핵심 의사결정(D-01 ~ D-11)과 기각된 대안·근거 기록 *(다른 AI 참여 시 필독)*
 - [SKILL_AUTHORING_GUIDE.md](./SKILL_AUTHORING_GUIDE.md) — `SKILL.md` 표준 Frontmatter 규격, `draft` → `official` 승격 규칙, 클린 재작성(Rewrite) 원칙
 - [AGENTS.md](./AGENTS.md) — 이 저장소 자체를 수정·관리하는 AI 에이전트 지침
 - [templates/PROJECT_AGENTS_ROUTING.md](./templates/PROJECT_AGENTS_ROUTING.md) — 개별 프로젝트의 `AGENTS.md` / `CLAUDE.md`에 붙여 넣는 단계별 주력 스킬 라우팅 템플릿

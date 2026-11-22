@@ -4,6 +4,9 @@
 
 ## 기본 규칙
 
+0. **의사결정 히스토리 우선 확인**
+   - 아키텍처 변경, 새 도구/인덱스 도입, 판정 방식 변경을 제안하기 전에 반드시 [docs/DECISION_HISTORY.md](./docs/DECISION_HISTORY.md)를 먼저 읽습니다. 사용자가 명시적으로 재검토를 요청하지 않는 한, 이미 기각·확정된 대안을 반복 제안하지 않습니다.
+
 1. **표준 단일 플랫 구조 유지**
    - 모든 스킬은 `skills/<skill-name>/SKILL.md`에 배치합니다.
    - 수동 인덱스 파일(`skills-index.yaml`, `skill-index.md`)이나 물리적 `drafts/` 폴더를 만들지 않습니다. 모든 탐색 메타데이터와 `draft`/`official` 상태는 각 `SKILL.md`의 YAML frontmatter가 단일 원본(SSoT)입니다.
