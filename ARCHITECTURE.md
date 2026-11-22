@@ -118,8 +118,30 @@ Gate 0을 통과하면 치명적 스펙 변경이 없는 한 사람의 개입 �
 
 ---
 
-## 5. 점진적 자동화 로드맵
+## 5. 워크플로우 하네스 및 프로젝트 CLI 제어 아키텍처 (Phase 2 대상)
 
-1. **1단계 (표준 스킬 + 강한 가이드)**: 중앙 레포(`rd-skills`) 세팅, 프로젝트별 심볼릭 링크 연결, `AGENTS.md` 라우팅 가이드 배치, 핵심 스킬 실전 가동.
-2. **2단계 (피드백 기반 스킬 정교화)**: 실제 R&D 과제에 태워보며 나오는 실패를 **스킬 선교정 PR**로 축적·재작성하고 `draft` → `official` 승격 사이클 정착.
-3. **3단계 (검증된 루틴의 선택적 자동화)**: 안정화된 검증(골든셋 A 단일 명령 실행, 병렬 리뷰어 실행, frontmatter 기반 경량 검색 CLI)부터 점진적으로 스크립트/CI화.
+스킬(`rd-skills`)이 충분히 검증된 뒤 자동화를 얹을 때는 **두꺼운 스킬(`rd-skills`) + 얇은 Go 하네스(`rd-harness`) + 표준 프로젝트 CLI 계약**의 3계층으로 결합합니다.
+
+### ① 기술 스택 및 제어 경계
+* **오케스트레이션 엔진**: **Go** 단일 바이너리 + SQLite (저메모리 상시 데몬, `errgroup` 기반 골든셋 A·B 병렬 실행, 프로젝트/레포 락, 상태 머신·Interrupt/Resume). 특수 분석/스크립트가 필요한 모듈만 Python 서브프로세스로 연결합니다.
+* **단일 AI 실행 인터페이스 (`AgentExecutor`)**: LangChain/LangGraph 도입은 보류하고, Go 인터페이스 1개로 Gemini · Claude · Codex(코딩 CLI 및 모델 API)를 통일해 역할별 1줄 스위칭과 교차 검증을 지원합니다.
+* **채팅 진입점 분리**:
+  * **수신·송신부(Channel Gateway)**와 **내부 처리부(Chat Core)**를 완전 분리합니다.
+  * 1차 채널은 **Telegram 프로젝트별 개별 채팅방 (`1 Chat = 1 Project`)**으로 격리 운영하고, 추후 Slack·Web UI·CLI와 상위 메인 오케스트레이터 뷰를 Gateway 어댑터로 확장합니다.
+* **컨테이너 없는 1인 경량 격리**:
+  * 서로 다른 레포는 병렬 허용, 같은 물리 Git 레포(예: 모노레포 내 여러 앱)는 `repo_lock_key`로 순차 제어합니다.
+  * 실행(Run)별 산출물은 파일 기반(`runs/<run-id>/`)으로 저장하고, 골든셋 A(실행 권한)와 골든셋 B(`readOnly: true`)를 별도 OS 프로세스로 격리 실행합니다.
+
+### ② 프로젝트 CLI 제어 계약 (CLI-Operable Project)
+하네스(Go)와 AI가 프로젝트 내부 기술(RN·Web·Server)에 종속되지 않고 조작·보고할 수 있도록, 각 프로젝트는 표준 CLI 명령 계약(`rd-project.yaml`)을 노출합니다.
+* **결정론적 직접 제어 (No-AI)**: `status`, `static_check`, `test`, `e2e`, `build_check`, `build_apk`, `ios_boot` 등 — Go 하네스가 직접 실행해 종료 코드·로그·아티팩트 경로를 즉시 보고.
+* **지능형 작업 제어 (AI + Skills)**: `AgentExecutor`가 `rd-skills`를 주력으로 로드해 설계·구현·병렬 골든셋·교정 지시를 수행.
+* **앱 개발 원칙**: 신규 앱·기능은 GUI 수동 확인에만 의존하지 않고, 핵심 검증·빌드·스모크 E2E를 CLI 1줄로 재현할 수 있게(CLI-Operable) 설계합니다.
+
+---
+
+## 6. 점진적 자동화 로드맵
+
+1. **1단계 (표준 스킬 + 강한 가이드 — 최우선)**: 중앙 레포(`rd-skills`) 세팅, 프로젝트별 심볼릭 링크 연결, `AGENTS.md` 중요 경계 라우팅 배치, 핵심 스킬 실전 적용 및 CLI-Operable 습관화.
+2. **2단계 (피드백 기반 스킬 정교화)**: 실제 R&D 과제 실패 사례를 **스킬 선교정 PR**로 축적·클린 재작성하고 `draft` → `official` 승격 사이클 정착.
+3. **3단계 (Go 하네스 + Telegram 제어 구축)**: `AgentExecutor` + `rd-project.yaml` 실행기 + SQLite 상태 머신 + 프로젝트별 Telegram 채팅 Gateway 구축.
