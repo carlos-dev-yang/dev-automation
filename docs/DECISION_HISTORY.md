@@ -1,6 +1,6 @@
 # Architecture Decision History (의사결정 히스토리)
 
-> **목적**: 이 문서는 2026-11-15 ~ 2026-11-22 논의 과정에서 **어떤 대안들을 검토했고, 왜 현재 구조로 확정했는지**를 기록합니다.
+> **목적**: 이 문서는 2026-11-15 ~ 2026-11-25 논의 과정에서 **어떤 대안들을 검토했고, 왜 현재 구조로 확정했는지**를 기록합니다.
 > 이 저장소에 참여하는 모든 AI 에이전트(Gemini, Claude, Codex, Grok 등)는 아래 **확정된 결정(Settled Decisions)**을 존중해야 하며, 사용자가 명시적으로 재검토를 요청하지 않는 한 이미 기각된 대안을 반복 제안하지 않습니다.
 
 ---
@@ -21,6 +21,7 @@
 | **D-10** | 채팅 구조·프로젝트 제어 | 단일 통합 채팅, 텔레그램 토픽, GUI 수동 검증 의존 | **수신부/처리부 분리** + 텔레그램 **프로젝트별 채팅방** + **CLI-Operable 프로젝트 계약** |
 | **D-11** | 구축 우선순위 | 자동화 시스템부터 선구축 | **스킬 단단하게 적용·검증(1순위)** → Go 하네스 및 텔레그램 자동화(2순위) |
 | **D-12** | 스킬 일원화·형제 배치·Git 링크 | 프로젝트별 별도 로컬 스킬 폴더, 비개발 스킬 물리 분리, 심볼릭 링크 `.gitignore` | **전 스킬(`core`/`stack:*`/`general`/`project:<repo>`) 단일 일원화** + **형제 디렉터리 고정(`../../dev-automation/skills`)** + **대상 프로젝트 Git(`120000`) 등록** |
+| **D-13** | Go 하네스 통합·역할 배치·Telegram | 별도 하네스 레포 분리, Webhook 서버, 벤더 강제 3분리만 허용 | **`dev-automation/harness/` 단일 레포 통합**(런타임은 `~/.dev-automation/` 격리) + **프로세스/세션 완전 분리 기반 `gemini`/`claude` 역할 배치** + **로컬 실행기 + Telegram Long-Polling** |
 
 ---
 
@@ -122,3 +123,18 @@
   * 공용(`core`), 스택(`stack:*`), 비개발(`general`), 특정 프로젝트 전용(`project:<repo>`)까지 **모든 스킬을 `dev-automation/skills/` 단일 플랫 구조로 일원화**하고, 오동작 차단은 `description`(레포·사용 조건 명시)과 `metadata.scopes`로 제어.
   * 스킬 실행에 필요한 추가 환경·런타임 요건은 `SKILL.md` 사전 요건에 명시. 범용/비개발 자체 스크립트는 `skills/<name>/scripts/`에 동봉하고, 프로젝트 종속 스크립트는 해당 프로젝트에 두되 `SKILL.md`에서 CWD 기준 경로로 참조.
   * 모든 대상 프로젝트는 기존 `.agents/skills`·`.claude/skills` 실폴더를 비운 뒤 `../../dev-automation/skills` 심볼릭 링크를 생성해 **대상 프로젝트 Git(`120000`)에 직접 등록**(`scripts/link-project.mjs`에서 형제 배치 검증).
+
+### D-13. `dev-automation/harness/` 통합 + 프로세스 분리 역할 배치 + 로컬 실행기/Telegram Long-Polling
+* **검토했던 대안**:
+  1. Go 하네스를 별도 저장소(`rd-harness`)로 분리
+  2. Telegram Webhook HTTPS 서버 구성
+  3. 3자 분리를 반드시 서로 다른 3개 벤더로만 제한
+* **기각 이유**:
+  * 스킬 출력 계약(`Gate 0`, `Golden Set A/B`, `Remediation Sequence`)과 하네스 파서·상태 머신은 한 셋이므로, 레포 분리 시 버전 드리프트와 온보딩 복잡도만 증가함. (대상 프로젝트는 `../../dev-automation/skills`만 링크하므로 `harness/` 노출 없음)
+  * 1인 로컬 Mac 데몬 환경에서는 공인 IP/TLS가 필요한 Webhook보다 Long-Polling(`getUpdates`)이 단순·안전함.
+  * D-05 3자 분리의 본질은 **구현 컨텍스트와 평가 컨텍스트의 완전 단절(독립 스레드·별도 OS 프로세스)**이며, 실행기만 독립 분리하면 동일 벤더 CLI를 쓰더라도 확증 편향을 차단할 수 있음(설정 1줄로 타 어댑터 확장 가능).
+* **최종 결정**:
+  * 하네스 소스는 `dev-automation/harness/`에 두고, 런타임 상태(SQLite DB, `runs/`, 시크릿 토큰)는 레포 바깥 `~/.dev-automation/`에 격리.
+  * 기본 역할 매핑(독립 프로세스 분리 실행): Stage 1 기획·Gate 0 = `gemini`, Stage 2 구현 = `claude`, Stage 3-A 골든셋 A = No-AI Runner + `claude`(신규 독립 프로세스), Stage 3-B 골든셋 B = `gemini`(Read-Only), Stage 4 진단·스킬 교정 = `gemini`.
+  * 내부 테스트 가능한 로컬 실행기(`LocalCLIGateway`)와 외부 운영 창구(`TelegramGateway` Long-Polling + `allowed_user_ids` 화이트리스트)를 동일 `Chat Core` 위에 배치.
+  * Stage 4 스킬 교정 AI(`ops-skill-evolution`)는 `skills/` 경로만 수정 가능하며 `harness/` 무단 수정을 금지(Meta Reward Hacking 차단).

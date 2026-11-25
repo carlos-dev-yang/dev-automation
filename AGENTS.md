@@ -20,3 +20,6 @@
    - 스킬을 추가하거나 수정한 뒤에는 반드시 `node scripts/validate-skills.mjs`를 실행해 frontmatter·네이밍·메타데이터·상대 링크에 오류가 없는지 확인합니다.
 5. **원격 작업 경계**
    - Git 원격 등록, push, PR 생성 및 머지는 사용자가 명시적으로 요청하거나 승인한 범위에서만 수행합니다.
+6. **스킬 교정 ↔ 하네스 수정 경계 (Meta Reward Hacking 차단)**
+   - Stage 4 스킬 교정(`ops-skill-evolution`) 작업은 오직 `skills/` 하위 경로만 수정할 수 있으며, `harness/`의 게이트 판정·상태 머신 코드는 사용자의 명시적 요청 없이 수정하지 않습니다.
+   - 하네스 런타임 상태(SQLite DB, `runs/`, 텔레그램 토큰 등)는 반드시 레포 바깥(`~/.dev-automation/`)에 저장하고 저장소에 커밋하지 않습니다.
