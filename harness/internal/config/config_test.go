@@ -9,6 +9,7 @@ import (
 func TestLoadHarnessConfigDefaultsAndEnv(t *testing.T) {
 	tmp := t.TempDir()
 	t.Setenv("RD_HARNESS_HOME", tmp)
+	t.Setenv("ANTHROPIC_API_KEY", "sk-ant-env-123")
 	t.Setenv("TELEGRAM_BOT_TOKEN", "env-token-123")
 
 	cfg, err := LoadHarnessConfig(filepath.Join(tmp, "nonexistent.yaml"))
@@ -21,8 +22,18 @@ func TestLoadHarnessConfigDefaultsAndEnv(t *testing.T) {
 	if cfg.Roles.Planner != "gemini" || cfg.Roles.Implementer != "claude" || cfg.Roles.GoldenA != "claude" || cfg.Roles.GoldenB != "gemini" || cfg.Roles.Remediation != "gemini" || cfg.Roles.SkillCurator != "gemini" {
 		t.Fatalf("unexpected default roles: %+v", cfg.Roles)
 	}
+	if cfg.APIs.AnthropicAPIKey != "sk-ant-env-123" {
+		t.Fatalf("expected env anthropic key, got %q", cfg.APIs.AnthropicAPIKey)
+	}
+	// Core LoadHarnessConfig must NOT load channel adapter secrets automatically.
+	if cfg.Telegram.BotToken != "" {
+		t.Fatalf("expected core config to ignore TELEGRAM_BOT_TOKEN until adapter loads it, got %q", cfg.Telegram.BotToken)
+	}
+	if err := LoadTelegramAdapterEnv(cfg); err != nil {
+		t.Fatalf("LoadTelegramAdapterEnv failed: %v", err)
+	}
 	if cfg.Telegram.BotToken != "env-token-123" {
-		t.Fatalf("expected env bot token, got %q", cfg.Telegram.BotToken)
+		t.Fatalf("expected adapter loader to read env bot token, got %q", cfg.Telegram.BotToken)
 	}
 	if cfg.IsUserAllowed(999) {
 		t.Fatalf("empty whitelist must deny all users")
@@ -94,5 +105,57 @@ commands:
 	}
 	if pc.RepoLockKey != "app-factory-mono" || pc.Commands["test"] != "pnpm test" || pc.Commands["status"] == "" {
 		t.Fatalf("unexpected parsed project config: %+v", pc)
+	}
+}
+
+func TestLoadDotEnvAndPrecedence(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("RD_HARNESS_HOME", tmp)
+	t.Setenv("ANTHROPIC_API_KEY", "")
+	t.Setenv("TELEGRAM_BOT_TOKEN", "proc-token-wins")
+	t.Setenv("TELEGRAM_ALLOWED_USER_IDS", "")
+
+	// Core .env holds only core secrets (and even if someone accidentally puts TELEGRAM_* here, core ignores it).
+	envFile := filepath.Join(tmp, ".env")
+	coreContent := `# comment line
+ANTHROPIC_API_KEY="sk-ant-from-dotenv"
+TELEGRAM_BOT_TOKEN=should-be-ignored-in-core
+`
+	if err := os.WriteFile(envFile, []byte(coreContent), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Adapter-isolated telegram.env holds Telegram credentials.
+	tgEnvFile := filepath.Join(tmp, "adapters", "telegram.env")
+	_ = os.MkdirAll(filepath.Dir(tgEnvFile), 0o700)
+	tgContent := `TELEGRAM_BOT_TOKEN=dotenv-token-loses
+export TELEGRAM_ALLOWED_USER_IDS=111, 222
+`
+	if err := os.WriteFile(tgEnvFile, []byte(tgContent), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := LoadHarnessConfig(filepath.Join(tmp, "config.yaml"))
+	if err != nil {
+		t.Fatalf("LoadHarnessConfig failed: %v", err)
+	}
+	if cfg.APIs.AnthropicAPIKey != "sk-ant-from-dotenv" {
+		t.Fatalf("expected ANTHROPIC_API_KEY from core .env, got %q", cfg.APIs.AnthropicAPIKey)
+	}
+	if cfg.Telegram.BotToken != "" {
+		t.Fatalf("core .env must not load TELEGRAM_BOT_TOKEN, got %q", cfg.Telegram.BotToken)
+	}
+
+	if err := LoadTelegramAdapterEnv(cfg); err != nil {
+		t.Fatalf("LoadTelegramAdapterEnv failed: %v", err)
+	}
+	if cfg.Telegram.BotToken != "proc-token-wins" {
+		t.Fatalf("expected process env to override telegram.env, got %q", cfg.Telegram.BotToken)
+	}
+	if !cfg.IsUserAllowed(111) || !cfg.IsUserAllowed(222) || cfg.IsUserAllowed(333) {
+		t.Fatalf("expected TELEGRAM_ALLOWED_USER_IDS parsed from telegram.env, got %v", cfg.Telegram.AllowedUserIDs)
+	}
+	if cfg.Conversation.Orchestrator.Adapter != "anthropic-api" || cfg.Conversation.Orchestrator.Model != "claude-haiku-5-5" {
+		t.Fatalf("unexpected default orchestrator binding: %+v", cfg.Conversation.Orchestrator)
 	}
 }

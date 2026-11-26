@@ -5,12 +5,26 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"time"
 
 	"gopkg.in/yaml.v3"
 )
 
-// RoleConfig maps workflow roles to AgentExecutor adapter names.
+// RoleModel binds a logical agent role to a specific provider adapter and model name.
+type RoleModel struct {
+	Adapter string `yaml:"adapter"`
+	Model   string `yaml:"model"`
+}
+
+// ConversationRoles separates the frontline user-facing chat model from the central orchestrator model.
+// Default: ChatResponder = gpt-6-luna (user dialogue & result presentation), Orchestrator = claude-haiku (context/skill routing, task ordering & remaining work calculation).
+type ConversationRoles struct {
+	ChatResponder RoleModel `yaml:"chat_responder"`
+	Orchestrator  RoleModel `yaml:"orchestrator"`
+}
+
+// RoleConfig maps workflow worker roles to AgentExecutor adapter names.
 // Default mapping follows D-13: gemini for planning/review/remediation, claude for implementation/golden-a (separate OS process).
 type RoleConfig struct {
 	Planner      string `yaml:"planner"`
@@ -28,22 +42,39 @@ type TelegramConfig struct {
 	PollTimeoutSeconds int     `yaml:"poll_timeout_seconds"`
 }
 
-// AdapterModels holds optional model and budget overrides per CLI adapter.
+// AdapterModels holds optional model, binary, auth project, and budget overrides per CLI adapter.
 type AdapterModels struct {
 	ClaudeModel        string  `yaml:"claude_model,omitempty"`
 	GeminiModel        string  `yaml:"gemini_model,omitempty"`
+	GeminiCloudProject string  `yaml:"gemini_cloud_project,omitempty"`
+	CodexBinary        string  `yaml:"codex_binary,omitempty"`
 	ClaudeMaxBudgetUSD float64 `yaml:"claude_max_budget_usd,omitempty"`
+}
+
+// ProtocolConfig holds settings for the external channel-agnostic HTTP/JSON + SSE ingress/egress protocol.
+type ProtocolConfig struct {
+	ListenAddr string `yaml:"listen_addr"`
+	AuthToken  string `yaml:"auth_token,omitempty"`
+}
+
+// APIConfig holds direct HTTP API provider credentials loaded primarily from ~/.dev-automation/.env or process env.
+type APIConfig struct {
+	AnthropicAPIKey  string `yaml:"anthropic_api_key,omitempty"`
+	AnthropicBaseURL string `yaml:"anthropic_base_url,omitempty"`
 }
 
 // HarnessConfig is the runtime configuration stored outside the repo (default ~/.dev-automation/config.yaml).
 type HarnessConfig struct {
-	RuntimeDir         string         `yaml:"runtime_dir"`
-	CentralRepoDir     string         `yaml:"central_repo_dir"`
-	MaxRetries         int            `yaml:"max_retries"`
-	StepTimeoutSeconds int            `yaml:"step_timeout_seconds"`
-	Roles              RoleConfig     `yaml:"roles"`
-	Models             AdapterModels  `yaml:"models"`
-	Telegram           TelegramConfig `yaml:"telegram"`
+	RuntimeDir         string            `yaml:"runtime_dir"`
+	CentralRepoDir     string            `yaml:"central_repo_dir"`
+	MaxRetries         int               `yaml:"max_retries"`
+	StepTimeoutSeconds int               `yaml:"step_timeout_seconds"`
+	Conversation       ConversationRoles `yaml:"conversation"`
+	Roles              RoleConfig        `yaml:"roles"`
+	Models             AdapterModels     `yaml:"models"`
+	APIs               APIConfig         `yaml:"apis,omitempty"`
+	Protocol           ProtocolConfig    `yaml:"protocol"`
+	Telegram           TelegramConfig    `yaml:"telegram"`
 }
 
 // ProjectConfig defines the CLI-Operable contract in <project-root>/rd-project.yaml.
@@ -68,6 +99,16 @@ func DefaultHarnessConfig() *HarnessConfig {
 		RuntimeDir:         runtimeDir,
 		MaxRetries:         2,
 		StepTimeoutSeconds: 600,
+		Conversation: ConversationRoles{
+			ChatResponder: RoleModel{
+				Adapter: "codex",
+				Model:   "gpt-6-luna",
+			},
+			Orchestrator: RoleModel{
+				Adapter: "anthropic-api",
+				Model:   "claude-haiku-5-5",
+			},
+		},
 		Roles: RoleConfig{
 			Planner:      "gemini",
 			Implementer:  "claude",
@@ -75,6 +116,9 @@ func DefaultHarnessConfig() *HarnessConfig {
 			GoldenB:      "gemini",
 			Remediation:  "gemini",
 			SkillCurator: "gemini",
+		},
+		Protocol: ProtocolConfig{
+			ListenAddr: "127.0.0.1:8787",
 		},
 		Telegram: TelegramConfig{
 			PollTimeoutSeconds: 30,
@@ -101,15 +145,83 @@ func LoadHarnessConfig(path string) (*HarnessConfig, error) {
 	if envHome := os.Getenv("RD_HARNESS_HOME"); envHome != "" {
 		cfg.RuntimeDir = envHome
 	}
-	if envToken := os.Getenv("TELEGRAM_BOT_TOKEN"); envToken != "" {
-		cfg.Telegram.BotToken = envToken
+
+	// Load core secrets from ~/.dev-automation/.env (or RD_ENV_FILE); process env vars override.
+	// Channel adapter secrets (e.g. Telegram) are intentionally NOT loaded from core .env.
+	envFile := os.Getenv("RD_ENV_FILE")
+	if envFile == "" {
+		envFile = cfg.EnvPath()
 	}
-	if envCentral := os.Getenv("RD_CENTRAL_REPO"); envCentral != "" {
-		cfg.CentralRepoDir = envCentral
+	dotEnv, err := LoadDotEnv(envFile)
+	if err != nil {
+		return nil, err
+	}
+	getCoreEnv := func(key string) string {
+		if v := os.Getenv(key); v != "" {
+			return v
+		}
+		return dotEnv[key]
+	}
+
+	if v := getCoreEnv("ANTHROPIC_API_KEY"); v != "" {
+		cfg.APIs.AnthropicAPIKey = v
+	}
+	if v := getCoreEnv("ANTHROPIC_BASE_URL"); v != "" {
+		cfg.APIs.AnthropicBaseURL = v
+	}
+	if v := getCoreEnv("RD_CENTRAL_REPO"); v != "" {
+		cfg.CentralRepoDir = v
+	}
+	if v := getCoreEnv("RD_PROTOCOL_ADDR"); v != "" {
+		cfg.Protocol.ListenAddr = v
+	}
+	if v := getCoreEnv("RD_PROTOCOL_TOKEN"); v != "" {
+		cfg.Protocol.AuthToken = v
+	}
+	if v := getCoreEnv("CODEX_BINARY"); v != "" {
+		cfg.Models.CodexBinary = v
+	}
+	if v := getCoreEnv("GOOGLE_CLOUD_PROJECT"); v != "" && cfg.Models.GeminiCloudProject == "" {
+		cfg.Models.GeminiCloudProject = v
+	} else if v := getCoreEnv("GOOGLE_CLOUD_PROJECT_ID"); v != "" && cfg.Models.GeminiCloudProject == "" {
+		cfg.Models.GeminiCloudProject = v
 	}
 
 	applyConfigDefaults(cfg)
 	return cfg, nil
+}
+
+// LoadTelegramAdapterEnv loads Telegram adapter-only credentials from ~/.dev-automation/adapters/telegram.env
+// (or RD_TELEGRAM_ENV_FILE) and process env vars, keeping channel secrets isolated from harness core .env.
+func LoadTelegramAdapterEnv(cfg *HarnessConfig) error {
+	envFile := os.Getenv("RD_TELEGRAM_ENV_FILE")
+	if envFile == "" {
+		envFile = cfg.TelegramEnvPath()
+	}
+	dotEnv, err := LoadDotEnv(envFile)
+	if err != nil {
+		return err
+	}
+	getEnv := func(key string) string {
+		if v := os.Getenv(key); v != "" {
+			return v
+		}
+		return dotEnv[key]
+	}
+	if v := getEnv("TELEGRAM_BOT_TOKEN"); v != "" {
+		cfg.Telegram.BotToken = v
+	}
+	if v := getEnv("TELEGRAM_ALLOWED_USER_IDS"); v != "" {
+		if parsed := parseInt64CSV(v); len(parsed) > 0 {
+			cfg.Telegram.AllowedUserIDs = parsed
+		}
+	}
+	if v := getEnv("TELEGRAM_POLL_TIMEOUT_SECONDS"); v != "" {
+		if sec, err := strconv.Atoi(v); err == nil && sec > 0 {
+			cfg.Telegram.PollTimeoutSeconds = sec
+		}
+	}
+	return nil
 }
 
 func applyConfigDefaults(cfg *HarnessConfig) {
@@ -122,6 +234,18 @@ func applyConfigDefaults(cfg *HarnessConfig) {
 	}
 	if cfg.StepTimeoutSeconds <= 0 {
 		cfg.StepTimeoutSeconds = def.StepTimeoutSeconds
+	}
+	if cfg.Conversation.ChatResponder.Adapter == "" {
+		cfg.Conversation.ChatResponder.Adapter = def.Conversation.ChatResponder.Adapter
+	}
+	if cfg.Conversation.ChatResponder.Model == "" {
+		cfg.Conversation.ChatResponder.Model = def.Conversation.ChatResponder.Model
+	}
+	if cfg.Conversation.Orchestrator.Adapter == "" {
+		cfg.Conversation.Orchestrator.Adapter = def.Conversation.Orchestrator.Adapter
+	}
+	if cfg.Conversation.Orchestrator.Model == "" {
+		cfg.Conversation.Orchestrator.Model = def.Conversation.Orchestrator.Model
 	}
 	if cfg.Roles.Planner == "" {
 		cfg.Roles.Planner = def.Roles.Planner
@@ -140,6 +264,9 @@ func applyConfigDefaults(cfg *HarnessConfig) {
 	}
 	if cfg.Roles.SkillCurator == "" {
 		cfg.Roles.SkillCurator = def.Roles.SkillCurator
+	}
+	if cfg.Protocol.ListenAddr == "" {
+		cfg.Protocol.ListenAddr = def.Protocol.ListenAddr
 	}
 	if cfg.Telegram.PollTimeoutSeconds <= 0 {
 		cfg.Telegram.PollTimeoutSeconds = def.Telegram.PollTimeoutSeconds
@@ -165,6 +292,15 @@ func (c *HarnessConfig) DBPath() string {
 	return filepath.Join(c.RuntimeDir, "state.db")
 }
 
+func (c *HarnessConfig) EnvPath() string {
+	return filepath.Join(c.RuntimeDir, ".env")
+}
+
+// TelegramEnvPath returns the isolated secrets path for the Telegram channel adapter.
+func (c *HarnessConfig) TelegramEnvPath() string {
+	return filepath.Join(c.RuntimeDir, "adapters", "telegram.env")
+}
+
 func (c *HarnessConfig) RunsDir() string {
 	return filepath.Join(c.RuntimeDir, "runs")
 }
@@ -182,6 +318,12 @@ func (c *HarnessConfig) SkillsDir() string {
 		return ""
 	}
 	return filepath.Join(c.CentralRepoDir, "skills")
+}
+
+// CodexAuthDir returns the harness-internal directory (outside the repo, under ~/.dev-automation/)
+// where ChatGPT subscription auth for Codex CLI is stored.
+func (c *HarnessConfig) CodexAuthDir() string {
+	return filepath.Join(c.RuntimeDir, "auth", "codex")
 }
 
 // IsUserAllowed checks the strict Telegram whitelist. Empty list denies all users.

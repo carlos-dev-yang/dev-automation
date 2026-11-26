@@ -14,8 +14,11 @@ import (
 	"github.com/google/uuid"
 	"golang.org/x/sync/errgroup"
 
+	"github.com/carlos-dev-yang/dev-automation/harness/internal/chat"
 	"github.com/carlos-dev-yang/dev-automation/harness/internal/config"
 	"github.com/carlos-dev-yang/dev-automation/harness/internal/executor"
+	"github.com/carlos-dev-yang/dev-automation/harness/internal/orchestrator"
+	"github.com/carlos-dev-yang/dev-automation/harness/internal/protocol"
 	"github.com/carlos-dev-yang/dev-automation/harness/internal/runner"
 	"github.com/carlos-dev-yang/dev-automation/harness/internal/store"
 )
@@ -44,10 +47,12 @@ type Notifier func(ctx context.Context, msg OutgoingMessage)
 
 // Engine implements the platform-agnostic Chat Core and Stage 1-4 Workflow State Machine (D-09, D-10).
 type Engine struct {
-	cfg      *config.HarnessConfig
-	store    *store.Store
-	registry *executor.Registry
-	notify   Notifier
+	cfg           *config.HarnessConfig
+	store         *store.Store
+	registry      *executor.Registry
+	orchestrator  *orchestrator.Service
+	chatResponder *chat.Responder
+	notify        Notifier
 
 	mu           sync.Mutex
 	activeCancel map[string]context.CancelFunc
@@ -61,13 +66,80 @@ func NewEngine(cfg *config.HarnessConfig, st *store.Store, reg *executor.Registr
 	if notify == nil {
 		notify = func(context.Context, OutgoingMessage) {}
 	}
+	ctxReg := orchestrator.NewLocalContextRegistry(st, cfg.SkillsDir())
+	orch := orchestrator.NewService(cfg, reg, ctxReg, nil)
+	responder := chat.NewResponder(cfg, reg, orch)
 	return &Engine{
 		cfg:           cfg,
 		store:         st,
 		registry:      reg,
+		orchestrator:  orch,
+		chatResponder: responder,
 		notify:        notify,
 		activeCancel:  make(map[string]context.CancelFunc),
 		AsyncDispatch: true,
+	}
+}
+
+// SetNotifier replaces the async notification sink (e.g. wiring to protocol.Broker.Publish).
+func (e *Engine) SetNotifier(notify Notifier) {
+	if notify == nil {
+		notify = func(context.Context, OutgoingMessage) {}
+	}
+	e.mu.Lock()
+	e.notify = notify
+	e.mu.Unlock()
+}
+
+// HandleProtocolMessage adapts the channel-agnostic protocol envelope to Chat Core.
+func (e *Engine) HandleProtocolMessage(ctx context.Context, msg protocol.IngressMessage) (protocol.EgressMessage, error) {
+	reply, err := e.HandleMessage(ctx, IncomingMessage{
+		Channel: msg.Channel,
+		ChatID:  msg.ChatID,
+		UserID:  msg.UserID,
+		Text:    msg.Text,
+	})
+	if err != nil {
+		return protocol.EgressMessage{}, err
+	}
+	return ToProtocolEgress(reply, msg.MessageID), nil
+}
+
+// ProtocolHealth reports Chat Core readiness and registered AI executors.
+func (e *Engine) ProtocolHealth(_ context.Context) protocol.HealthStatus {
+	var adapters []string
+	if e.registry != nil {
+		adapters = e.registry.Names()
+	}
+	chatBind := e.cfg.Conversation.ChatResponder
+	orchBind := e.cfg.Conversation.Orchestrator
+	return protocol.HealthStatus{
+		Status:          "ok",
+		ProtocolVersion: protocol.Version,
+		ChatResponder:   fmt.Sprintf("%s/%s", chatBind.Adapter, chatBind.Model),
+		Orchestrator:    fmt.Sprintf("%s/%s", orchBind.Adapter, orchBind.Model),
+		PlannerAdapter:  e.cfg.Roles.Planner,
+		Adapters:        adapters,
+		Timestamp:       time.Now().UTC(),
+	}
+}
+
+// ToProtocolEgress converts a core OutgoingMessage to a standard protocol.EgressMessage.
+func ToProtocolEgress(msg OutgoingMessage, replyTo string) protocol.EgressMessage {
+	actions := make([]protocol.Action, 0, len(msg.Actions))
+	for _, a := range msg.Actions {
+		actions = append(actions, protocol.Action{Label: a.Label, Data: a.Data})
+	}
+	return protocol.EgressMessage{
+		ProtocolVersion: protocol.Version,
+		MessageID:       uuid.NewString(),
+		ReplyTo:         replyTo,
+		Channel:         msg.Channel,
+		ChatID:          msg.ChatID,
+		Text:            msg.Text,
+		Attachment:      msg.Attachment,
+		Actions:         actions,
+		Timestamp:       time.Now().UTC(),
 	}
 }
 
@@ -98,6 +170,26 @@ func (e *Engine) HandleMessage(ctx context.Context, msg IncomingMessage) (Outgoi
 		switch cmd {
 		case "/start", "/help":
 			return OutgoingMessage{Channel: msg.Channel, ChatID: msg.ChatID, Text: helpText()}, nil
+		case "/ping":
+			return OutgoingMessage{
+				Channel: msg.Channel,
+				ChatID:  msg.ChatID,
+				Text: fmt.Sprintf("pong (protocol=%s, channel=%s, chat_id=%s, chat=%s/%s, orchestrator=%s/%s, planner=%s)",
+					protocol.Version, msg.Channel, msg.ChatID,
+					e.cfg.Conversation.ChatResponder.Adapter, e.cfg.Conversation.ChatResponder.Model,
+					e.cfg.Conversation.Orchestrator.Adapter, e.cfg.Conversation.Orchestrator.Model,
+					e.cfg.Roles.Planner),
+			}, nil
+		case "/chat":
+			return e.handleTwoTierChat(ctx, msg, arg)
+		case "/tasks":
+			return e.handleTasks(ctx, msg)
+		case "/nodes":
+			return e.handleNodes(ctx, msg)
+		case "/ask":
+			return e.handleAsk(ctx, msg, arg)
+		case "/reset":
+			return e.handleResetChat(ctx, msg)
 		case "/bind":
 			return e.handleBind(ctx, msg, arg)
 		case "/new":
@@ -129,9 +221,15 @@ func (e *Engine) HandleMessage(ctx context.Context, msg IncomingMessage) (Outgoi
 func helpText() string {
 	return strings.Join([]string{
 		"rd-harness commands (1 Chat = 1 Project):",
+		"  /ping                      Verify external ingress/egress protocol round-trip (No-AI)",
+		"  /chat <message>            Two-tier chat: ChatResponder (gpt-6-luna) -> Central Orchestrator (claude-haiku)",
+		"  /tasks                     Show Orchestrator prioritized task queue & remaining count",
+		"  /nodes                     Show Context Registry nodes & discovered skills count",
+		"  /ask <message>             Direct single-model test turn with Planner adapter",
+		"  /reset                     Reset chat session for this chat room",
 		"  /bind <project-name|path>  Bind this chat to a sibling project & check symlinks",
 		"  /new <task title>          Start a new Run in Stage 1 (PLANNING)",
-		"  <plain text>               Discuss blueprint with Stage 1 Planner (gemini)",
+		"  <plain text>               Discuss blueprint with Stage 1 Planner (or /chat if no active Run)",
 		"  /gate0                     Run Gate 0 blueprint check",
 		"  /approve                   Approve Gate 0, Skill Correction, or Final Release",
 		"  /reject <reason>           Reject current approval gate and return to planning",
@@ -141,6 +239,154 @@ func helpText() string {
 		"  /retry                     Resume a WAITING_HUMAN Run into Stage 2",
 		"  /abort                     Cancel in-flight Run and kill active subprocesses",
 	}, "\n")
+}
+
+func (e *Engine) handleTwoTierChat(ctx context.Context, msg IncomingMessage, text string) (OutgoingMessage, error) {
+	if strings.TrimSpace(text) == "" {
+		return OutgoingMessage{Channel: msg.Channel, ChatID: msg.ChatID, Text: "Usage: /chat <message>"}, nil
+	}
+	chatBind := e.cfg.Conversation.ChatResponder
+	sessionKey := "chat:" + chatBind.Adapter
+
+	var prevSession string
+	if prevAdapter, sid, err := e.store.GetChatSession(ctx, msg.Channel, msg.ChatID); err == nil && prevAdapter == sessionKey {
+		prevSession = sid
+	}
+
+	resp, err := e.chatResponder.HandleChat(ctx, chat.ChatRequest{
+		Channel:   msg.Channel,
+		ChatID:    msg.ChatID,
+		UserID:    msg.UserID,
+		Text:      text,
+		SessionID: prevSession,
+	})
+	if err != nil {
+		return OutgoingMessage{
+			Channel: msg.Channel,
+			ChatID:  msg.ChatID,
+			Text:    fmt.Sprintf("Chat pipeline error: %v", err),
+		}, nil
+	}
+	if resp.SessionID != "" {
+		_ = e.store.UpsertChatSession(ctx, msg.Channel, msg.ChatID, sessionKey, resp.SessionID)
+	}
+	return OutgoingMessage{
+		Channel: msg.Channel,
+		ChatID:  msg.ChatID,
+		Text:    resp.Text,
+	}, nil
+}
+
+func (e *Engine) handleTasks(ctx context.Context, msg IncomingMessage) (OutgoingMessage, error) {
+	snap, err := e.orchestrator.SnapshotContext(ctx, msg.Channel, msg.ChatID)
+	if err != nil {
+		return OutgoingMessage{}, err
+	}
+	bl := snap.Backlog
+	var b strings.Builder
+	b.WriteString(fmt.Sprintf("[Orchestrator Backlog: %s]\n", bl.ScopeKey))
+	b.WriteString(fmt.Sprintf("- Remaining: %d | Completed: %d | Total: %d\n", bl.RemainingCount, bl.CompletedCount, bl.TotalCount))
+	if len(bl.Tasks) == 0 {
+		b.WriteString("No tasks queued yet. Send `/chat <requirement>` to plan and prioritize work.")
+	} else {
+		for _, t := range bl.Tasks {
+			b.WriteString(fmt.Sprintf("%d. [P%d][%s] %s (id=%s)\n", t.Order, t.Priority, t.Status, t.Title, t.ID))
+		}
+	}
+	return OutgoingMessage{Channel: msg.Channel, ChatID: msg.ChatID, Text: strings.TrimSpace(b.String())}, nil
+}
+
+func (e *Engine) handleNodes(ctx context.Context, msg IncomingMessage) (OutgoingMessage, error) {
+	snap, err := e.orchestrator.SnapshotContext(ctx, msg.Channel, msg.ChatID)
+	if err != nil {
+		return OutgoingMessage{}, err
+	}
+	var b strings.Builder
+	b.WriteString(fmt.Sprintf("[Orchestrator Context Registry]\n- ChatResponder: %s/%s\n- Orchestrator: %s/%s\n",
+		e.cfg.Conversation.ChatResponder.Adapter, e.cfg.Conversation.ChatResponder.Model,
+		e.cfg.Conversation.Orchestrator.Adapter, e.cfg.Conversation.Orchestrator.Model))
+	if snap.BoundNode != nil {
+		b.WriteString(fmt.Sprintf("- Bound Node: %s (%s)\n", snap.BoundNode.Name, snap.BoundNode.RootPath))
+	} else {
+		b.WriteString("- Bound Node: (none)\n")
+	}
+	b.WriteString(fmt.Sprintf("- Registered Nodes: %d\n", len(snap.Nodes)))
+	for _, n := range snap.Nodes {
+		b.WriteString(fmt.Sprintf("  * %s -> %s\n", n.Name, n.RootPath))
+	}
+	b.WriteString(fmt.Sprintf("- Indexed Skills (SSoT frontmatter): %d", len(snap.Skills)))
+	return OutgoingMessage{Channel: msg.Channel, ChatID: msg.ChatID, Text: b.String()}, nil
+}
+
+func (e *Engine) handleAsk(ctx context.Context, msg IncomingMessage, prompt string) (OutgoingMessage, error) {
+	if strings.TrimSpace(prompt) == "" {
+		return OutgoingMessage{Channel: msg.Channel, ChatID: msg.ChatID, Text: "Usage: /ask <message>"}, nil
+	}
+
+	execAdapter, err := e.registry.Get(e.cfg.Roles.Planner)
+	if err != nil {
+		return OutgoingMessage{}, err
+	}
+
+	workDir := e.cfg.CentralRepoDir
+	scopeLabel := "general"
+	if proj, err := e.store.GetBoundProject(ctx, msg.Channel, msg.ChatID); err == nil {
+		workDir = proj.RootPath
+		scopeLabel = proj.Name
+	}
+	if workDir == "" {
+		workDir = e.cfg.RuntimeDir
+		_ = os.MkdirAll(workDir, 0o700)
+	}
+
+	var prevSession string
+	if prevAdapter, sid, err := e.store.GetChatSession(ctx, msg.Channel, msg.ChatID); err == nil && prevAdapter == execAdapter.Name() {
+		prevSession = sid
+	}
+
+	req := executor.Request{
+		WorkDir:      workDir,
+		SystemPrompt: fmt.Sprintf("You are the conversational AI assistant inside rd-harness (scope=%s, channel=%s). Reply concisely and accurately in the user's language. Do NOT modify files.", scopeLabel, msg.Channel),
+		Prompt:       prompt,
+		Mode:         executor.ModeReadOnly,
+		SessionID:    prevSession,
+		Timeout:      e.cfg.StepTimeout(),
+		Model:        e.modelForAdapter(execAdapter.Name()),
+		ExtraEnv:     e.extraEnvForAdapter(execAdapter.Name()),
+	}
+
+	resp, runErr := execAdapter.Run(ctx, req)
+	if resp != nil && resp.SessionID != "" {
+		_ = e.store.UpsertChatSession(ctx, msg.Channel, msg.ChatID, execAdapter.Name(), resp.SessionID)
+	}
+	if runErr != nil {
+		return OutgoingMessage{
+			Channel: msg.Channel,
+			ChatID:  msg.ChatID,
+			Text:    fmt.Sprintf("AI (%s) error: %v", execAdapter.Name(), runErr),
+		}, nil
+	}
+
+	replyText := strings.TrimSpace(resp.TextOutput)
+	if replyText == "" {
+		replyText = "(empty response)"
+	}
+	return OutgoingMessage{
+		Channel: msg.Channel,
+		ChatID:  msg.ChatID,
+		Text:    replyText,
+	}, nil
+}
+
+func (e *Engine) handleResetChat(ctx context.Context, msg IncomingMessage) (OutgoingMessage, error) {
+	if err := e.store.DeleteChatSession(ctx, msg.Channel, msg.ChatID); err != nil {
+		return OutgoingMessage{}, err
+	}
+	return OutgoingMessage{
+		Channel: msg.Channel,
+		ChatID:  msg.ChatID,
+		Text:    "Chat session reset for this room.",
+	}, nil
 }
 
 func (e *Engine) handleBind(ctx context.Context, msg IncomingMessage, arg string) (OutgoingMessage, error) {
@@ -294,6 +540,7 @@ func (e *Engine) handlePlanningChat(ctx context.Context, msg IncomingMessage, te
 		SkillFiles:   skillFiles,
 		Timeout:      e.cfg.StepTimeout(),
 		Model:        e.modelForAdapter(execAdapter.Name()),
+		ExtraEnv:     e.extraEnvForAdapter(execAdapter.Name()),
 	}
 
 	attemptID := uuid.NewString()
@@ -381,6 +628,7 @@ func (e *Engine) handleGate0(ctx context.Context, msg IncomingMessage) (Outgoing
 		JSONSchema:   Gate0Schema,
 		Timeout:      e.cfg.StepTimeout(),
 		Model:        e.modelForAdapter(execAdapter.Name()),
+		ExtraEnv:     e.extraEnvForAdapter(execAdapter.Name()),
 	}
 
 	attemptID := uuid.NewString()
@@ -966,6 +1214,7 @@ func (e *Engine) runStage3ParallelGates(ctx context.Context, proj *store.Project
 			JSONSchema:   GoldenBSchema,
 			Timeout:      e.cfg.StepTimeout(),
 			Model:        e.modelForAdapter(adapterB.Name()),
+			ExtraEnv:     e.extraEnvForAdapter(adapterB.Name()),
 		}
 		attemptID := uuid.NewString()
 		started := time.Now().UTC()
@@ -1034,6 +1283,7 @@ func (e *Engine) runStage4Remediation(ctx context.Context, proj *store.Project, 
 		JSONSchema:   RemediationSchema,
 		Timeout:      e.cfg.StepTimeout(),
 		Model:        e.modelForAdapter(execAdapter.Name()),
+		ExtraEnv:     e.extraEnvForAdapter(execAdapter.Name()),
 	}
 
 	attemptID := uuid.NewString()
@@ -1085,6 +1335,7 @@ func (e *Engine) runStage4SkillEvolution(ctx context.Context, proj *store.Projec
 		JSONSchema:   SkillEvolutionSchema,
 		Timeout:      e.cfg.StepTimeout(),
 		Model:        e.modelForAdapter(execAdapter.Name()),
+		ExtraEnv:     e.extraEnvForAdapter(execAdapter.Name()),
 	}
 
 	attemptID := uuid.NewString()
@@ -1167,12 +1418,15 @@ func (e *Engine) moveToWaitingHuman(ctx context.Context, projectID, runID string
 }
 
 func (e *Engine) notifyProjectChannels(ctx context.Context, projectID, text, attachment string, actions []ActionButton) {
-	for _, ch := range []string{"telegram", "local"} {
-		b, err := e.store.GetChatBindingByProject(ctx, ch, projectID)
-		if err != nil {
-			continue
-		}
-		e.notify(ctx, OutgoingMessage{
+	bindings, err := e.store.ListChatBindingsByProject(ctx, projectID)
+	if err != nil {
+		return
+	}
+	e.mu.Lock()
+	notify := e.notify
+	e.mu.Unlock()
+	for _, b := range bindings {
+		notify(ctx, OutgoingMessage{
 			Channel:    b.Channel,
 			ChatID:     b.ChatID,
 			Text:       text,
@@ -1214,6 +1468,13 @@ func (e *Engine) modelForAdapter(name string) string {
 	default:
 		return ""
 	}
+}
+
+func (e *Engine) extraEnvForAdapter(name string) []string {
+	if name == "gemini" && strings.TrimSpace(e.cfg.Models.GeminiCloudProject) != "" {
+		return []string{"GOOGLE_CLOUD_PROJECT=" + strings.TrimSpace(e.cfg.Models.GeminiCloudProject)}
+	}
+	return nil
 }
 
 func appendPlanningTurn(path, userText, replyText string) {

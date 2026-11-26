@@ -1,6 +1,6 @@
 # Architecture Decision History (의사결정 히스토리)
 
-> **목적**: 이 문서는 2026-11-15 ~ 2026-11-25 논의 과정에서 **어떤 대안들을 검토했고, 왜 현재 구조로 확정했는지**를 기록합니다.
+> **목적**: 이 문서는 2026-11-15 ~ 2026-11-27 논의 과정에서 **어떤 대안들을 검토했고, 왜 현재 구조로 확정했는지**를 기록합니다.
 > 이 저장소에 참여하는 모든 AI 에이전트(Gemini, Claude, Codex, Grok 등)는 아래 **확정된 결정(Settled Decisions)**을 존중해야 하며, 사용자가 명시적으로 재검토를 요청하지 않는 한 이미 기각된 대안을 반복 제안하지 않습니다.
 
 ---
@@ -22,6 +22,7 @@
 | **D-11** | 구축 우선순위 | 자동화 시스템부터 선구축 | **스킬 단단하게 적용·검증(1순위)** → Go 하네스 및 텔레그램 자동화(2순위) |
 | **D-12** | 스킬 일원화·형제 배치·Git 링크 | 프로젝트별 별도 로컬 스킬 폴더, 비개발 스킬 물리 분리, 심볼릭 링크 `.gitignore` | **전 스킬(`core`/`stack:*`/`general`/`project:<repo>`) 단일 일원화** + **형제 디렉터리 고정(`../../dev-automation/skills`)** + **대상 프로젝트 Git(`120000`) 등록** |
 | **D-13** | Go 하네스 통합·역할 배치·Telegram | 별도 하네스 레포 분리, Webhook 서버, 벤더 강제 3분리만 허용 | **`dev-automation/harness/` 단일 레포 통합**(런타임은 `~/.dev-automation/` 격리) + **프로세스/세션 완전 분리 기반 `gemini`/`claude` 역할 배치** + **로컬 실행기 + Telegram Long-Polling** |
+| **D-14** | 외부 프로토콜·2계층 채팅/오케스트레이션·인증 격리 | 단일 채팅 모델(Gemini), Telegram 토큰 코어 `.env` 혼재, Claude 구독 CLI 봇 래핑, 로컬 Mac WIF 선도입 | **외부 송수신 프로토콜(`HTTP+JSON`+`SSE`) 1급 분리** + **앞단 채팅(`codex/gpt-6-luna`) ↔ 중앙 오케스트레이터(`anthropic-api/claude-haiku-5-5`) 2계층 분리** + **코어/어댑터 시크릿 분리** + **메인 비서(1)→오케스트레이터(1)→서브 스레드(N) & SQLite 영속 컨텍스트** |
 
 ---
 
@@ -138,3 +139,24 @@
   * 기본 역할 매핑(독립 프로세스 분리 실행): Stage 1 기획·Gate 0 = `gemini`, Stage 2 구현 = `claude`, Stage 3-A 골든셋 A = No-AI Runner + `claude`(신규 독립 프로세스), Stage 3-B 골든셋 B = `gemini`(Read-Only), Stage 4 진단·스킬 교정 = `gemini`.
   * 내부 테스트 가능한 로컬 실행기(`LocalCLIGateway`)와 외부 운영 창구(`TelegramGateway` Long-Polling + `allowed_user_ids` 화이트리스트)를 동일 `Chat Core` 위에 배치.
   * Stage 4 스킬 교정 AI(`ops-skill-evolution`)는 `skills/` 경로만 수정 가능하며 `harness/` 무단 수정을 금지(Meta Reward Hacking 차단).
+
+### D-14. 외부 송수신 프로토콜 1급 분리 + 2계층 채팅·오케스트레이션 + 인증·시크릿 경계 + 멀티 스레드 방향
+* **검토했던 대안**:
+  1. Telegram 모듈이 `core.Engine`을 직접 호출하고, 채팅·오케스트레이션을 단일 모델(Gemini 구독 CLI)로 처리
+  2. Anthropic Claude Pro/Max 소비자 구독 OAuth(`claude -p`)를 상시 봇/하네스 백엔드에 연결
+  3. 로컬 Mac 데몬에서 Anthropic Workload Identity Federation(OIDC WIF) 즉시 도입
+  4. `TELEGRAM_BOT_TOKEN`을 하네스 코어 `.env`에 함께 보관
+* **기각 이유**:
+  * 외부 채널(Telegram 등)이 하네스 코어에 강결합되면 프로토콜 단독 테스트와 향후 Slack/Web UI 확장이 어려움.
+  * 앞단 대화와 중앙 작업 분배·우선순위·잔여 작업 계산을 한 모델에 몰면 채팅이 특정 작업에 종속되고 관리가 무너짐.
+  * Anthropic은 2026년 소비자 구독 OAuth의 서드파티 하네스·봇 래핑을 명시 금지하고 계정 정지 단속을 강화함. 반면 최신 `claude-haiku-5-5` HTTP API는 입력 \$0.10/1M(캐시 \$0.01/1M), 출력 \$0.50/1M으로 1인 운영 시 월 \$1~2 수준이며 속도·캐싱·비용 통제 면에서도 압도적으로 유리.
+  * Anthropic WIF(OIDC)는 공인 HTTPS JWKS를 제공하는 클라우드/CI(GitHub Actions, AWS, GCP 등)용이며, 로컬 Mac 데몬에는 공인 OIDC Issuer가 없어 오히려 복잡도만 증가(추후 클라우드 전환 시 `AnthropicAuthProvider` 인터페이스로 교체 가능).
+  * 텔레그램 토큰은 특정 채널 어댑터의 자격 증명이므로 채널 중립 코어 `.env`와 분리되어야 함.
+* **최종 결정**:
+  * **외부 송수신 프로토콜(`internal/protocol`)**: `Transport` 인터페이스 + `HTTP+JSON`(`POST /v1/messages`, `GET /v1/health`) + `SSE`(`GET /v1/events`)를 1급 경계로 열고, Telegram·Local CLI를 순수 어댑터로 부착.
+  * **2계층 대화·오케스트레이션 분리**:
+    * 앞단 채팅(`internal/chat`, `ChatResponder`): 기본 `codex/gpt-6-luna` (ChatGPT 구독 CLI, 하네스 내부 `~/.dev-automation/auth/codex` 저장, ChatGPT 앱 번들 최신 바이너리 우선 선택) — 요구사항 전달과 결과 채팅 응답 변환에만 집중.
+    * 중앙 오케스트레이터(`internal/orchestrator`, `Orchestrator`): 기본 `anthropic-api/claude-haiku-5-5` (Anthropic HTTP Messages API + Prompt Caching `ephemeral`) — 노드/스킬 카탈로그 탐색, 작업 순서·우선순위·잔여량 계산, 내부 지시 담당.
+  * **시크릿 격리**: 코어 전용 `~/.dev-automation/.env`(`ANTHROPIC_API_KEY`, 선택 `RD_PROTOCOL_TOKEN`)와 어댑터 전용 `~/.dev-automation/adapters/telegram.env`(`TELEGRAM_BOT_TOKEN`, `TELEGRAM_ALLOWED_USER_IDS`)를 물리·로더 레벨에서 완전 분리.
+  * **멀티 프로젝트·서브 스레드 & SQLite 영속 컨텍스트 방향**: 봇 1개의 메인 AI 비서 창구 → 중앙 오케스트레이터(스레드 매니저) → 프로젝트별 독립 서브 스레드(`WorkThread`/`runs`, N개) 3층 구조로 발전시키며, 전체 대화 기록(`chat_messages`)과 오케스트레이터 백로그(`orchestrator_tasks`)는 SQLite를 단일 원본(SSoT)으로 영속화해 API 호출 시 필요한 컨텍스트(최근 N턴 + 스레드 요약 카드)만 슬라이싱 주입.
+  * **구축 순서 유지**: 앞단 통신·2계층 채팅·오케스트레이터 영속/스레드 관리 환경이 안착된 뒤 Stage 2~4 하네스 핵심 보장 기능(동적 스킬 선택, Living Blueprint, Slice 분할 루프)을 순차 고도화.

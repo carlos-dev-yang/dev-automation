@@ -14,27 +14,35 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/carlos-dev-yang/dev-automation/harness/internal/config"
-	"github.com/carlos-dev-yang/dev-automation/harness/internal/core"
+	"github.com/carlos-dev-yang/dev-automation/harness/internal/protocol"
 )
 
 const telegramMaxMessageLen = 4000
 
-// TelegramGateway implements a Long-Polling Channel Gateway with 1 Chat = 1 Project and strict user_id whitelist (D-10, D-13).
+// TelegramGateway is an external channel adapter that bridges Telegram Long-Polling
+// to the harness exclusively through the channel-agnostic protocol.Transport.
 type TelegramGateway struct {
-	cfg     *config.HarnessConfig
-	engine  *core.Engine
-	client  *http.Client
-	baseURL string
-	logger  *log.Logger
-	offset  int64
+	cfg       *config.HarnessConfig
+	transport protocol.Transport
+	client    *http.Client
+	baseURL   string
+	logger    *log.Logger
+	offset    int64
+
+	workersMu sync.Mutex
+	workers   map[int64]chan tgUpdate
 }
 
-func NewTelegramGateway(cfg *config.HarnessConfig, engine *core.Engine, logger *log.Logger) (*TelegramGateway, error) {
+func NewTelegramGateway(cfg *config.HarnessConfig, transport protocol.Transport, logger *log.Logger) (*TelegramGateway, error) {
 	if strings.TrimSpace(cfg.Telegram.BotToken) == "" {
 		return nil, errors.New("telegram bot_token is empty (set in ~/.dev-automation/config.yaml or TELEGRAM_BOT_TOKEN)")
+	}
+	if transport == nil {
+		return nil, errors.New("telegram gateway requires a protocol.Transport")
 	}
 	if logger == nil {
 		logger = log.Default()
@@ -44,13 +52,14 @@ func NewTelegramGateway(cfg *config.HarnessConfig, engine *core.Engine, logger *
 		pollSec = 30
 	}
 	return &TelegramGateway{
-		cfg:     cfg,
-		engine:  engine,
-		baseURL: "https://api.telegram.org/bot" + cfg.Telegram.BotToken,
+		cfg:       cfg,
+		transport: transport,
+		baseURL:   "https://api.telegram.org/bot" + cfg.Telegram.BotToken,
 		client: &http.Client{
 			Timeout: time.Duration(pollSec+15) * time.Second,
 		},
-		logger: logger,
+		logger:  logger,
+		workers: make(map[int64]chan tgUpdate),
 	}, nil
 }
 
@@ -59,8 +68,25 @@ func (g *TelegramGateway) SetBaseURL(url string) {
 	g.baseURL = strings.TrimRight(url, "/")
 }
 
-// Notify delivers async Chat Core updates to Telegram.
-func (g *TelegramGateway) Notify(ctx context.Context, msg core.OutgoingMessage) {
+// VerifyBot checks token validity via Telegram getMe API before entering the polling loop.
+func (g *TelegramGateway) VerifyBot(ctx context.Context) (string, error) {
+	resp, _, err := g.callJSON(ctx, "getMe", map[string]any{})
+	if err != nil {
+		return "", err
+	}
+	var me struct {
+		ID        int64  `json:"id"`
+		Username  string `json:"username"`
+		FirstName string `json:"first_name"`
+	}
+	if err := json.Unmarshal(resp.Result, &me); err != nil {
+		return "", fmt.Errorf("decode getMe: %w", err)
+	}
+	return fmt.Sprintf("@%s (id=%d)", me.Username, me.ID), nil
+}
+
+// Notify delivers an async protocol.EgressMessage to Telegram.
+func (g *TelegramGateway) Notify(ctx context.Context, msg protocol.EgressMessage) {
 	if msg.Channel != "telegram" || msg.ChatID == "" {
 		return
 	}
@@ -69,8 +95,24 @@ func (g *TelegramGateway) Notify(ctx context.Context, msg core.OutgoingMessage) 
 	}
 }
 
-// Run starts the Long-Polling loop until ctx is cancelled.
+// Run subscribes to async protocol events and runs the Telegram Long-Polling loop until ctx is cancelled.
 func (g *TelegramGateway) Run(ctx context.Context) error {
+	if botIdentity, err := g.VerifyBot(ctx); err != nil {
+		g.logger.Printf("[telegram] warning: getMe check failed: %v", err)
+	} else {
+		g.logger.Printf("[telegram] authenticated as %s", botIdentity)
+	}
+
+	events, err := g.transport.Subscribe(ctx, "telegram")
+	if err != nil {
+		return fmt.Errorf("telegram subscribe protocol events: %w", err)
+	}
+	go func() {
+		for ev := range events {
+			g.Notify(ctx, ev)
+		}
+	}()
+
 	g.logger.Printf("[telegram] long-polling started (allowed_users=%d, poll_timeout=%ds)", len(g.cfg.Telegram.AllowedUserIDs), g.cfg.Telegram.PollTimeoutSeconds)
 	backoff := time.Second
 	for {
@@ -105,9 +147,50 @@ func (g *TelegramGateway) Run(ctx context.Context) error {
 			if u.UpdateID >= g.offset {
 				g.offset = u.UpdateID + 1
 			}
-			g.HandleUpdate(ctx, u)
+			g.dispatchUpdate(ctx, u)
 		}
 	}
+}
+
+// dispatchUpdate queues updates per chat_id so slow AI turns in one chat do not block polling or other chats.
+func (g *TelegramGateway) dispatchUpdate(ctx context.Context, u tgUpdate) {
+	chatID := extractChatID(u)
+	if chatID == 0 {
+		return
+	}
+	g.workersMu.Lock()
+	ch, ok := g.workers[chatID]
+	if !ok {
+		ch = make(chan tgUpdate, 32)
+		g.workers[chatID] = ch
+		go func(queue <-chan tgUpdate) {
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case upd := <-queue:
+					g.HandleUpdate(ctx, upd)
+				}
+			}
+		}(ch)
+	}
+	g.workersMu.Unlock()
+
+	select {
+	case ch <- u:
+	default:
+		g.logger.Printf("[telegram] chat=%d worker queue full; dropping update_id=%d", chatID, u.UpdateID)
+	}
+}
+
+func extractChatID(u tgUpdate) int64 {
+	if u.CallbackQuery != nil && u.CallbackQuery.Message != nil {
+		return u.CallbackQuery.Message.Chat.ID
+	}
+	if u.Message != nil {
+		return u.Message.Chat.ID
+	}
+	return 0
 }
 
 type tgUpdate struct {
@@ -151,22 +234,31 @@ type tgAPIResponse struct {
 	} `json:"parameters"`
 }
 
-// HandleUpdate enforces the user_id whitelist (TC-08) and routes messages/callbacks to Chat Core.
+// HandleUpdate enforces the user_id whitelist (TC-08) and forwards normalized messages over protocol.Transport.
 func (g *TelegramGateway) HandleUpdate(ctx context.Context, u tgUpdate) {
 	var senderID int64
+	var username string
 	var chatID int64
+	var chatTitle string
 	var text string
 	var callbackID string
+	var msgID string
 
 	if u.CallbackQuery != nil && u.CallbackQuery.Message != nil {
 		senderID = u.CallbackQuery.From.ID
+		username = u.CallbackQuery.From.Username
 		chatID = u.CallbackQuery.Message.Chat.ID
+		chatTitle = u.CallbackQuery.Message.Chat.Title
 		text = strings.TrimSpace(u.CallbackQuery.Data)
 		callbackID = u.CallbackQuery.ID
+		msgID = "tg-cb-" + callbackID
 	} else if u.Message != nil {
 		senderID = u.Message.From.ID
+		username = u.Message.From.Username
 		chatID = u.Message.Chat.ID
+		chatTitle = u.Message.Chat.Title
 		text = strings.TrimSpace(u.Message.Text)
+		msgID = fmt.Sprintf("tg-%d-%d", chatID, u.Message.MessageID)
 	} else {
 		return
 	}
@@ -183,17 +275,34 @@ func (g *TelegramGateway) HandleUpdate(ctx context.Context, u tgUpdate) {
 		return
 	}
 
-	reply, err := g.engine.HandleMessage(ctx, core.IncomingMessage{
-		Channel: "telegram",
-		ChatID:  strconv.FormatInt(chatID, 10),
-		UserID:  fmt.Sprintf("tg:%d", senderID),
-		Text:    text,
+	chatIDStr := strconv.FormatInt(chatID, 10)
+	_ = g.sendChatAction(ctx, chatIDStr, "typing")
+
+	meta := map[string]string{
+		"telegram_update_id": strconv.FormatInt(u.UpdateID, 10),
+	}
+	if username != "" {
+		meta["telegram_username"] = username
+	}
+	if chatTitle != "" {
+		meta["telegram_chat_title"] = chatTitle
+	}
+
+	reply, err := g.transport.Send(ctx, protocol.IngressMessage{
+		MessageID: msgID,
+		Channel:   "telegram",
+		ChatID:    chatIDStr,
+		UserID:    fmt.Sprintf("tg:%d", senderID),
+		Text:      text,
+		Metadata:  meta,
+		SentAt:    time.Now().UTC(),
 	})
 	if err != nil {
-		_ = g.SendOutgoing(ctx, core.OutgoingMessage{
-			Channel: "telegram",
-			ChatID:  strconv.FormatInt(chatID, 10),
-			Text:    fmt.Sprintf("Error: %v", err),
+		_ = g.SendOutgoing(ctx, protocol.EgressMessage{
+			ProtocolVersion: protocol.Version,
+			Channel:         "telegram",
+			ChatID:          chatIDStr,
+			Text:            fmt.Sprintf("Error: %v", err),
 		})
 		return
 	}
@@ -220,7 +329,7 @@ func (g *TelegramGateway) getUpdates(ctx context.Context) ([]tgUpdate, time.Dura
 }
 
 // SendOutgoing splits messages >4000 chars, attaches inline action buttons to the last chunk, and uploads optional artifact files.
-func (g *TelegramGateway) SendOutgoing(ctx context.Context, msg core.OutgoingMessage) error {
+func (g *TelegramGateway) SendOutgoing(ctx context.Context, msg protocol.EgressMessage) error {
 	chunks := splitMessage(msg.Text, telegramMaxMessageLen)
 	for i, chunk := range chunks {
 		payload := map[string]any{
@@ -252,6 +361,14 @@ func (g *TelegramGateway) SendOutgoing(ctx context.Context, msg core.OutgoingMes
 		}
 	}
 	return nil
+}
+
+func (g *TelegramGateway) sendChatAction(ctx context.Context, chatID, action string) error {
+	_, _, err := g.callJSON(ctx, "sendChatAction", map[string]any{
+		"chat_id": chatID,
+		"action":  action,
+	})
+	return err
 }
 
 func (g *TelegramGateway) answerCallbackQuery(ctx context.Context, callbackID string) error {

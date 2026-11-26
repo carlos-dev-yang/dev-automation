@@ -8,20 +8,22 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/carlos-dev-yang/dev-automation/harness/internal/core"
+	"github.com/carlos-dev-yang/dev-automation/harness/internal/protocol"
 )
 
-// LocalCLIGateway provides an interactive local terminal gateway wired to the exact same Chat Core as Telegram.
+// LocalCLIGateway provides an interactive local terminal gateway wired through protocol.Transport,
+// exercising the exact same protocol contract as Telegram and HTTP adapters.
 type LocalCLIGateway struct {
-	engine *core.Engine
-	chatID string
-	userID string
-	in     io.Reader
-	out    io.Writer
-	mu     sync.Mutex
+	transport protocol.Transport
+	channel   string
+	chatID    string
+	userID    string
+	in        io.Reader
+	out       io.Writer
+	mu        sync.Mutex
 }
 
-func NewLocalCLIGateway(engine *core.Engine, chatID, userID string, in io.Reader, out io.Writer) *LocalCLIGateway {
+func NewLocalCLIGateway(transport protocol.Transport, chatID, userID string, in io.Reader, out io.Writer) *LocalCLIGateway {
 	if chatID == "" {
 		chatID = "local-default"
 	}
@@ -29,17 +31,18 @@ func NewLocalCLIGateway(engine *core.Engine, chatID, userID string, in io.Reader
 		userID = "local-operator"
 	}
 	return &LocalCLIGateway{
-		engine: engine,
-		chatID: chatID,
-		userID: userID,
-		in:     in,
-		out:    out,
+		transport: transport,
+		channel:   "local",
+		chatID:    chatID,
+		userID:    userID,
+		in:        in,
+		out:       out,
 	}
 }
 
-// Notify prints asynchronous pipeline updates from core.Engine cleanly.
-func (g *LocalCLIGateway) Notify(_ context.Context, msg core.OutgoingMessage) {
-	if msg.Channel != "local" || msg.ChatID != g.chatID {
+// Notify prints asynchronous protocol events cleanly.
+func (g *LocalCLIGateway) Notify(_ context.Context, msg protocol.EgressMessage) {
+	if msg.Channel != g.channel || msg.ChatID != g.chatID {
 		return
 	}
 	g.mu.Lock()
@@ -58,10 +61,10 @@ func (g *LocalCLIGateway) Notify(_ context.Context, msg core.OutgoingMessage) {
 	fmt.Fprint(g.out, "> ")
 }
 
-// RunOne executes a single command/message against Chat Core and writes the reply.
+// RunOne executes a single command/message through protocol.Transport and writes the reply.
 func (g *LocalCLIGateway) RunOne(ctx context.Context, text string) error {
-	reply, err := g.engine.HandleMessage(ctx, core.IncomingMessage{
-		Channel: "local",
+	reply, err := g.transport.Send(ctx, protocol.IngressMessage{
+		Channel: g.channel,
 		ChatID:  g.chatID,
 		UserID:  g.userID,
 		Text:    text,
@@ -73,8 +76,17 @@ func (g *LocalCLIGateway) RunOne(ctx context.Context, text string) error {
 	return nil
 }
 
-// RunInteractive starts a REPL for local end-to-end testing of the harness workflow.
+// RunInteractive starts a REPL connected to protocol.Transport (local in-process or remote HTTP).
 func (g *LocalCLIGateway) RunInteractive(ctx context.Context) error {
+	events, err := g.transport.Subscribe(ctx, g.channel)
+	if err == nil {
+		go func() {
+			for ev := range events {
+				g.Notify(ctx, ev)
+			}
+		}()
+	}
+
 	g.mu.Lock()
 	fmt.Fprintf(g.out, "rd-harness local runner (chat=%s). Type /help for commands, /quit to exit.\n> ", g.chatID)
 	g.mu.Unlock()
@@ -94,8 +106,8 @@ func (g *LocalCLIGateway) RunInteractive(ctx context.Context) error {
 		if line == "/quit" || line == "/exit" {
 			return nil
 		}
-		reply, err := g.engine.HandleMessage(ctx, core.IncomingMessage{
-			Channel: "local",
+		reply, err := g.transport.Send(ctx, protocol.IngressMessage{
+			Channel: g.channel,
 			ChatID:  g.chatID,
 			UserID:  g.userID,
 			Text:    line,
@@ -112,7 +124,7 @@ func (g *LocalCLIGateway) RunInteractive(ctx context.Context) error {
 	return scanner.Err()
 }
 
-func (g *LocalCLIGateway) printReply(reply core.OutgoingMessage) {
+func (g *LocalCLIGateway) printReply(reply protocol.EgressMessage) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	fmt.Fprintln(g.out, reply.Text)

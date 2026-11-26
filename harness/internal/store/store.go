@@ -188,6 +188,15 @@ CREATE TABLE IF NOT EXISTS run_events (
 );
 
 CREATE INDEX IF NOT EXISTS idx_run_events_run ON run_events(run_id, id);
+
+CREATE TABLE IF NOT EXISTS chat_sessions (
+	channel TEXT NOT NULL,
+	chat_id TEXT NOT NULL,
+	adapter TEXT NOT NULL,
+	session_id TEXT NOT NULL DEFAULT '',
+	updated_at TEXT NOT NULL,
+	PRIMARY KEY (channel, chat_id)
+);
 `
 	if _, err := s.db.Exec(schema); err != nil {
 		return fmt.Errorf("migrate sqlite schema: %w", err)
@@ -228,6 +237,26 @@ func (s *Store) GetProjectByName(ctx context.Context, name string) (*Project, er
 func (s *Store) GetProjectByID(ctx context.Context, id string) (*Project, error) {
 	row := s.db.QueryRowContext(ctx, `SELECT id, name, root_path, repo_lock_key, config_path, created_at FROM projects WHERE id = ?`, id)
 	return scanProject(row)
+}
+
+func (s *Store) ListProjects(ctx context.Context) ([]Project, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id, name, root_path, repo_lock_key, config_path, created_at FROM projects ORDER BY name ASC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []Project
+	for rows.Next() {
+		var p Project
+		var created string
+		if err := rows.Scan(&p.ID, &p.Name, &p.RootPath, &p.RepoLockKey, &p.ConfigPath, &created); err != nil {
+			return nil, err
+		}
+		p.CreatedAt = parseTime(created)
+		out = append(out, p)
+	}
+	return out, rows.Err()
 }
 
 func scanProject(row *sql.Row) (*Project, error) {
@@ -286,6 +315,59 @@ func (s *Store) GetChatBindingByProject(ctx context.Context, channel, projectID 
 	}
 	b.CreatedAt = parseTime(created)
 	return &b, nil
+}
+
+func (s *Store) ListChatBindingsByProject(ctx context.Context, projectID string) ([]ChatBinding, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT channel, chat_id, project_id, created_at
+		FROM chat_bindings
+		WHERE project_id = ?
+		ORDER BY created_at ASC
+	`, projectID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []ChatBinding
+	for rows.Next() {
+		var b ChatBinding
+		var created string
+		if err := rows.Scan(&b.Channel, &b.ChatID, &b.ProjectID, &created); err != nil {
+			return nil, err
+		}
+		b.CreatedAt = parseTime(created)
+		out = append(out, b)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) GetChatSession(ctx context.Context, channel, chatID string) (adapter, sessionID string, err error) {
+	row := s.db.QueryRowContext(ctx, `SELECT adapter, session_id FROM chat_sessions WHERE channel = ? AND chat_id = ?`, channel, chatID)
+	if err := row.Scan(&adapter, &sessionID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", "", ErrNotFound
+		}
+		return "", "", err
+	}
+	return adapter, sessionID, nil
+}
+
+func (s *Store) UpsertChatSession(ctx context.Context, channel, chatID, adapter, sessionID string) error {
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO chat_sessions(channel, chat_id, adapter, session_id, updated_at)
+		VALUES (?, ?, ?, ?, ?)
+		ON CONFLICT(channel, chat_id) DO UPDATE SET
+			adapter = excluded.adapter,
+			session_id = excluded.session_id,
+			updated_at = excluded.updated_at
+	`, channel, chatID, adapter, sessionID, nowStr())
+	return err
+}
+
+func (s *Store) DeleteChatSession(ctx context.Context, channel, chatID string) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM chat_sessions WHERE channel = ? AND chat_id = ?`, channel, chatID)
+	return err
 }
 
 func (s *Store) CreateRun(ctx context.Context, r Run) (*Run, error) {

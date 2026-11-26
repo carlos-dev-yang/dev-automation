@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 )
@@ -28,6 +29,14 @@ type Request struct {
 	Timeout        time.Duration
 	Model          string
 	MaxBudgetUSD   float64
+	ExtraEnv       []string
+}
+
+type TokenUsage struct {
+	InputTokens              int `json:"input_tokens,omitempty"`
+	CacheCreationInputTokens int `json:"cache_creation_input_tokens,omitempty"`
+	CacheReadInputTokens     int `json:"cache_read_input_tokens,omitempty"`
+	OutputTokens             int `json:"output_tokens,omitempty"`
 }
 
 type Response struct {
@@ -39,6 +48,7 @@ type Response struct {
 	ExitCode   int
 	Duration   time.Duration
 	TimedOut   bool
+	Usage      *TokenUsage
 }
 
 // AgentExecutor is the single unified interface across coding CLIs (D-09).
@@ -68,6 +78,15 @@ func (r *Registry) Get(name string) (AgentExecutor, error) {
 		return nil, fmt.Errorf("agent executor %q not registered", name)
 	}
 	return e, nil
+}
+
+func (r *Registry) Names() []string {
+	names := make([]string, 0, len(r.executors))
+	for k := range r.executors {
+		names = append(names, k)
+	}
+	sort.Strings(names)
+	return names
 }
 
 // BuildPromptWithSkills injects required SKILL.md contents and optional JSON contract directly into the prompt
